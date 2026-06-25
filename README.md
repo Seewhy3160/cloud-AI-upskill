@@ -1,4 +1,4 @@
-# StreamFlix — Cloud Migration Submission
+# StreamFlix — Cloud Migration Submission (Group 2)
 
 End-to-end deliverable for the StreamFlix streaming-infrastructure modernization: scope, architecture, and working Infrastructure-as-Code.
 
