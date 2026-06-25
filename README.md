@@ -1,226 +1,159 @@
-# StreamFlix — Infrastructure as Code (Terraform)
-
-Implements the StreamFlix multi-region AWS architecture as modular, deployable Terraform. Two active-active regions (primary + secondary), each with networking, security, compute (EKS), storage (S3), and data (Aurora PostgreSQL, Redis, MSK/Kafka, OpenSearch).
-
-> Provider note: the architecture targets AWS. Cloud provider selection was an open item; this code is the AWS implementation.
-
----
-
-## What you need before you start
-
-Install these three things on your machine.
-
-1. **Terraform** (v1.5 or newer). Download from https://developer.hashicorp.com/terraform/install
-   - Verify it works. Open PowerShell and run:
-     ```powershell
-     terraform version
-     ```
-2. **AWS CLI** (v2). Download from https://aws.amazon.com/cli/
-   - Verify:
-     ```powershell
-     aws --version
-     ```
-3. **An AWS account** with an IAM user (or SSO) that can create VPCs, EKS, RDS, S3, etc. Have an **Access Key ID** and **Secret Access Key** ready, or use SSO.
-
----
-
-## Folder layout
-
+StreamFlix — Cloud Migration Submission
+End-to-end deliverable for the StreamFlix streaming-infrastructure modernization: scope, architecture, and working Infrastructure-as-Code.
+Repository contents
 ```
-streamflix-terraform/
-├── bootstrap/              # Run FIRST. Creates the S3 bucket + DynamoDB
-│                           # table that store the main stack's state.
-└── terraform/              # The MAIN stack (the actual architecture).
-    ├── backend.tf          # Points at the bootstrap bucket (you edit 2 lines)
-    ├── main.tf             # Defines both regions
-    ├── variables.tf        # All input variables
-    ├── outputs.tf          # Values printed after apply
-    ├── terraform.tfvars.example   # Copy this to terraform.tfvars
+.
+├── README.md                  # This file — overview + setup instructions
+├── sow/
+│   ├── SOW.md                 # Statement of Work (source)
+│   └── SOW.pdf                # Statement of Work (PDF export)
+├── architecture/
+│   └── diagram.png            # AWS multi-region architecture diagram
+└── terraform/                 # Working Terraform (the main stack lives here)
+    ├── main.tf                # Root: defines both regions
+    ├── variables.tf           # Input variables
+    ├── outputs.tf             # Outputs printed after apply
+    ├── backend.tf             # Remote-state config (edit 2 lines)
+    ├── versions.tf            # Provider/version constraints
+    ├── terraform.tfvars.example
+    ├── bootstrap/             # Run FIRST: creates the state bucket + lock table
     └── modules/
-        ├── networking/     # VPC, subnets, IGW, NAT, route tables
-        ├── security/       # KMS, IAM roles, security groups
-        ├── storage/        # S3 content bucket + lifecycle tiering
-        ├── compute/        # EKS cluster + node group
-        ├── data/           # Aurora, Redis, MSK, OpenSearch
-        └── region/         # Glues the above into one regional stack
+        ├── networking/        # VPC, subnets, IGW, NAT, route tables
+        ├── security/          # KMS, IAM roles, security groups
+        ├── storage/           # S3 content bucket + lifecycle tiering
+        ├── compute/           # EKS cluster + node group
+        ├── data/              # Aurora, Redis, MSK (Kafka), OpenSearch
+        └── region/            # Composes the modules into one regional stack
 ```
-
+Documents
+Statement of Work — `sow/SOW.md` (and `sow/SOW.pdf`): executive summary, in/out-of-scope, business objectives, technical solution, security and compliance, timeline, risks.
+Architecture — `architecture/diagram.png`: two active-active AWS regions, each with edge delivery, EKS compute, streaming, data services, and cross-cutting security/observability.
 ---
-
-## Step-by-step deployment
-
-Do these in order. Commands are written for **Windows PowerShell**; macOS/Linux notes are in parentheses.
-
-### Step 1 — Give Terraform your AWS credentials
-
-Easiest method, run once per PowerShell session:
-
+Setup and deployment (Terraform)
+Prerequisites
+Terraform v1.5+ — https://developer.hashicorp.com/terraform/install
+AWS CLI v2 — https://aws.amazon.com/cli/
+An AWS account with credentials that can create VPC, EKS, RDS, MSK, OpenSearch, S3, IAM, KMS.
+Verify the tools:
+```powershell
+terraform version
+aws --version
+```
+> Commands below are written for **Windows PowerShell**. macOS/Linux equivalents are in parentheses.
+Why there's a bootstrap stack (and why it runs first)
+This project has two Terraform stacks: a small `bootstrap/` stack and the main stack. You must run `bootstrap/` first, once, before anything else. Here's why.
+The main stack keeps its state file (`terraform.tfstate`) in an S3 bucket, with a DynamoDB table for locking, instead of on your laptop. Remote state is what makes the project safe to share and run as a team:
+Shared source of truth — state lives in one place, not on one person's machine.
+Locking — the lock table stops two people from running `apply` at the same time and corrupting state.
+Durability and history — the bucket is versioned and encrypted, so state is backed up and protected.
+But this creates a chicken-and-egg problem: the main stack needs that bucket and table to already exist the moment it runs `terraform init` — it can't create the very thing it depends on. So something has to create them first.
+That "something" is the bootstrap stack. Its only job is to create:
+the S3 bucket that will hold the main stack's state, and
+the DynamoDB lock table.
+It runs with local state (a `terraform.tfstate` file on your disk), because at that point there is no remote backend to use yet. Once it finishes, you copy its two outputs into the main stack's `backend.tf` (Step 3), and from then on the main stack stores its state remotely in that bucket.
+```
+Step 2: bootstrap (local state)  ──creates──>  S3 bucket + DynamoDB lock table
+              │
+              └── outputs ──> paste into terraform/backend.tf (Step 3)
+                                    │
+Step 5: main stack (remote state) ──uses──>  that bucket + lock table
+```
+You run the bootstrap once, ever, at the very start, and only return to it at the very end to tear everything down — and in that order: destroy the main stack first, then the bootstrap (the state bucket can't be removed while the main stack is still using it).
+Step 1 — Provide AWS credentials
 ```powershell
 $env:AWS_ACCESS_KEY_ID     = "YOUR_ACCESS_KEY_ID"
 $env:AWS_SECRET_ACCESS_KEY = "YOUR_SECRET_ACCESS_KEY"
 $env:AWS_DEFAULT_REGION    = "us-east-1"
+aws sts get-caller-identity   # should print your account ID
 ```
-
-(Alternative: run `aws configure` once and it saves credentials permanently to a profile.)
-
-Check it worked:
-
+Step 2 — Create the remote-state backend (run once)
+This is the bootstrap stack (see "Why there's a bootstrap stack" above). It creates the S3 bucket and DynamoDB lock table the main stack will use for its state.
 ```powershell
-aws sts get-caller-identity
-```
-
-You should see your account number. If you get an error, your keys are wrong.
-
-### Step 2 — Create the remote-state backend (bootstrap)
-
-This makes one S3 bucket (to hold state) and one DynamoDB table (to lock state). Run it once, ever.
-
-```powershell
-cd streamflix-terraform\bootstrap
+cd terraform\bootstrap
 terraform init
 terraform apply -var="state_bucket_name=streamflix-tfstate-CHANGEME1234"
 ```
-
-- The bucket name must be **globally unique across all of AWS**. Replace `CHANGEME1234` with your own random characters.
-- Type `yes` when prompted.
-- When it finishes, it prints two outputs: `state_bucket_name` and `lock_table_name`. **Write these down.**
-
-### Step 3 — Point the main stack at that backend
-
-Open `terraform\backend.tf` in any text editor. Change the two marked lines to the values from Step 2:
-
+Bucket name must be globally unique — replace `CHANGEME1234`.
+Type `yes`. Note the two outputs: `state_bucket_name` and `lock_table_name`.
+Step 3 — Point the main stack at that backend
+Edit `terraform/backend.tf`, set the two marked lines to the Step 2 outputs:
 ```hcl
-bucket         = "streamflix-tfstate-CHANGEME1234"   # <- your state_bucket_name
-dynamodb_table = "streamflix-tf-locks"               # <- your lock_table_name
+bucket         = "streamflix-tfstate-CHANGEME1234"
+dynamodb_table = "streamflix-tf-locks"
 ```
-
-Leave `key`, `region`, and `encrypt` as they are (unless your state bucket is in a different region).
-
-### Step 4 — Set your variable values
-
+Step 4 — Set your variables
 ```powershell
-cd ..\terraform
-copy terraform.tfvars.example terraform.tfvars
+cd ..
+copy terraform.tfvars.example terraform.tfvars   # (cp on macOS/Linux)
 ```
-(macOS/Linux: `cp terraform.tfvars.example terraform.tfvars`)
-
-Open `terraform.tfvars` and change the two S3 content bucket names to something globally unique (add your own random suffix):
-
+Edit `terraform.tfvars` and set globally-unique content bucket names:
 ```hcl
 primary_content_bucket   = "streamflix-content-primary-CHANGEME1234"
 secondary_content_bucket = "streamflix-content-secondary-CHANGEME1234"
 ```
-
-### Step 5 — Initialise the main stack
-
+Step 5 — Deploy
 ```powershell
 terraform init
-```
-
-This downloads the AWS provider and connects to your remote state bucket. You should see "Terraform has been successfully initialized!"
-
-### Step 6 — Preview what will be created
-
-```powershell
 terraform plan
-```
-
-This shows everything Terraform will build. It changes nothing. Read the summary line at the bottom (e.g. "Plan: 80 to add").
-
-### Step 7 — Build the infrastructure
-
-```powershell
 terraform apply
 ```
-
-Review the plan, type `yes`. This takes **20–40 minutes** because EKS, Aurora, MSK, and OpenSearch are slow to create. When done, Terraform prints the outputs (VPC IDs, EKS cluster names, Aurora endpoint).
-
-### Step 8 — Tear it all down (when finished)
-
-This stops the bill. It deletes everything the main stack created.
-
+Type `yes`. Full apply takes 20–40 minutes (EKS, Aurora, MSK, and OpenSearch are slow to provision). Outputs (VPC IDs, EKS cluster names, Aurora endpoint) print on completion.
+Step 6 — Tear down (stops the bill)
+Destroy in this order: main stack first, then the bootstrap. The bootstrap's state bucket cannot be deleted while the main stack is still using it.
+1. Destroy the main stack (removes EKS, Aurora, Redis, MSK, OpenSearch, VPCs — everything billable):
 ```powershell
+cd terraform
 terraform destroy
 ```
-
-Type `yes`. To also remove the state bucket and lock table afterwards:
-
+2. Empty the versioned state bucket. The bootstrap bucket has versioning enabled, so Terraform cannot delete it while old object versions remain (you'll get `BucketNotEmpty`). Purge every version and delete-marker first (replace the bucket name with yours):
 ```powershell
-cd ..\bootstrap
-terraform destroy -var="state_bucket_name=streamflix-tfstate-CHANGEME1234"
+# delete all object versions
+aws s3api list-object-versions --bucket YOUR-STATE-BUCKET --region us-east-1 --query "Versions[].{Key:Key,VersionId:VersionId}" --output text | ForEach-Object {
+  $p = $_ -split "\s+"; if ($p[0]) { aws s3api delete-object --bucket YOUR-STATE-BUCKET --region us-east-1 --key $p[0] --version-id $p[1] }
+}
+# delete all delete-markers
+aws s3api list-object-versions --bucket YOUR-STATE-BUCKET --region us-east-1 --query "DeleteMarkers[].{Key:Key,VersionId:VersionId}" --output text | ForEach-Object {
+  $p = $_ -split "\s+"; if ($p[0]) { aws s3api delete-object --bucket YOUR-STATE-BUCKET --region us-east-1 --key $p[0] --version-id $p[1] }
+}
 ```
-
+3. Destroy the bootstrap (removes the now-empty bucket and the lock table):
+```powershell
+cd bootstrap
+terraform destroy -var="state_bucket_name=YOUR-STATE-BUCKET"
+```
+4. Confirm the account is clean (all should return empty `[]`):
+```powershell
+aws eks list-clusters --region us-east-1
+aws eks list-clusters --region eu-west-1
+aws rds describe-db-clusters --region us-east-1 --query "DBClusters[].DBClusterIdentifier"
+aws rds describe-db-clusters --region eu-west-1 --query "DBClusters[].DBClusterIdentifier"
+aws kafka list-clusters --region us-east-1 --query "ClusterInfoList[].ClusterName"
+aws kafka list-clusters --region eu-west-1 --query "ClusterInfoList[].ClusterName"
+aws opensearch list-domain-names --region us-east-1
+aws opensearch list-domain-names --region eu-west-1
+```
 ---
-
-## Standard Terraform commands (quick reference)
-
-| Command | What it does |
-|---|---|
-| `terraform fmt -recursive` | Auto-formats all `.tf` files |
-| `terraform validate` | Checks the code is syntactically valid |
-| `terraform init` | Downloads providers, connects backend |
-| `terraform plan` | Previews changes (creates nothing) |
-| `terraform apply` | Builds/updates infrastructure |
-| `terraform output` | Re-prints the output values |
-| `terraform destroy` | Deletes everything in the stack |
-
----
-
-## Variables reference
-
-### Bootstrap stack (`bootstrap/`)
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `state_bucket_name` | Yes | — | Globally-unique S3 bucket name for Terraform state |
-| `state_region` | No | `us-east-1` | Region for the state bucket and lock table |
-| `lock_table_name` | No | `streamflix-tf-locks` | DynamoDB table name for state locking |
-
-### Main stack (`terraform/`)
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `primary_content_bucket` | Yes | — | Globally-unique S3 content bucket (primary region) |
-| `secondary_content_bucket` | Yes | — | Globally-unique S3 content bucket (secondary region) |
-| `primary_region` | No | `us-east-1` | Primary (Region A) AWS region |
-| `secondary_region` | No | `eu-west-1` | Secondary (Region B) AWS region |
-| `project` | No | `streamflix` | Name prefix + tag applied to resources |
-| `environment` | No | `dev` | Environment tag (dev/staging/prod) |
-| `primary_vpc_cidr` | No | `10.0.0.0/16` | VPC CIDR for the primary region |
-| `secondary_vpc_cidr` | No | `10.1.0.0/16` | VPC CIDR for the secondary region |
-
-### Module-level variables (tunable, sensible defaults)
-
-These have defaults and only need changing if you want different sizing. Set them inside the `region` module call or expose them upward as needed.
-
-| Module | Variable | Default | Description |
-|---|---|---|---|
-| networking | `az_count` | `2` | Availability Zones per region |
-| compute | `kubernetes_version` | `1.30` | EKS version |
-| compute | `node_instance_types` | `["t3.medium"]` | Worker node instance type(s) |
-| compute | `node_desired_size` / `min` / `max` | `2 / 2 / 6` | Node group auto-scaling range |
-| data | `db_instance_class` | `db.t3.medium` | Aurora instance size |
-| data | `redis_node_type` | `cache.t3.micro` | Redis node size |
-| data | `msk_instance_type` | `kafka.t3.small` | Kafka broker size |
-| data | `opensearch_instance_type` | `t3.small.search` | OpenSearch node size |
-
----
-
-## Outputs
-
-After `terraform apply`, the main stack prints:
-
-| Output | Description |
-|---|---|
-| `primary_vpc_id` / `secondary_vpc_id` | The VPC IDs in each region |
-| `primary_eks_cluster` / `secondary_eks_cluster` | EKS cluster names |
-| `primary_aurora_endpoint` | Aurora PostgreSQL writer endpoint (primary) |
-
----
-
-## Cost and scope warnings
-
-- **This costs real money.** EKS, NAT Gateways, Aurora, MSK, and OpenSearch all bill hourly. Run `terraform destroy` when you are not using it. Defaults are the smallest sensible sizes for a dev/test deploy.
-- **Implemented in this code:** VPC/subnets/NAT/routing, KMS, IAM roles, security groups, S3 with lifecycle tiering, EKS cluster + node group, Aurora PostgreSQL, ElastiCache Redis, MSK (Kafka), OpenSearch.
-- **Shown on the architecture diagram but NOT in this code (deliberate scope cut — add as later modules):** CloudFront/Route 53 edge, WAF/Shield, Elemental MediaLive/MediaConvert, SageMaker, Redshift, Cognito, Transit Gateway / cross-region replication, and Kubernetes workloads (these are deployed *into* EKS separately, not by this stack).
-- Aurora's master password is auto-generated and stored in AWS Secrets Manager (via `manage_master_user_password`); it is never written to state in plaintext.
+Standard Terraform commands
+Command	Purpose
+`terraform fmt -recursive`	Format all `.tf` files
+`terraform validate`	Check syntax/validity
+`terraform init`	Download providers, connect backend
+`terraform plan`	Preview changes
+`terraform apply`	Build/update infrastructure
+`terraform output`	Re-print outputs
+`terraform destroy`	Delete everything
+Key variables
+Variable	Default	Description
+`primary_content_bucket`	— (required)	Globally-unique S3 content bucket (primary)
+`secondary_content_bucket`	— (required)	Globally-unique S3 content bucket (secondary)
+`primary_region`	`us-east-1`	Primary region
+`secondary_region`	`eu-west-1`	Secondary region
+`primary_vpc_cidr`	`10.0.0.0/16`	Primary VPC CIDR
+`secondary_vpc_cidr`	`10.1.0.0/16`	Secondary VPC CIDR
+`project` / `environment`	`streamflix` / `dev`	Naming + tags
+Module sizing variables (EKS node size, DB/Redis/Kafka/OpenSearch instance types) have sensible small defaults; see each module's `variables.tf`.
+Scope notes
+Implemented: VPC/subnets/NAT/routing, KMS, IAM, security groups, S3 with lifecycle tiering, EKS cluster + node group, Aurora PostgreSQL, ElastiCache Redis, MSK (Kafka), OpenSearch — across two active-active regions.
+On the diagram but not in code (intentional, future modules): CloudFront/Route 53 edge, WAF/Shield, Elemental MediaLive/MediaConvert, SageMaker, Redshift, Cognito, Transit Gateway cross-region replication, and Kubernetes workloads (deployed into EKS separately).
+Cost warning: this provisions real, billable infrastructure. Defaults are minimal sizes; run `terraform destroy` when not in use.
+Aurora's master password is auto-generated into AWS Secrets Manager and never stored in plaintext state.
