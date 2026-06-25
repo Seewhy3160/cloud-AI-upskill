@@ -1,0 +1,15 @@
+# Copy this file to terraform.tfvars and fill in your own values.
+# terraform.tfvars is git-ignored so your settings stay local.
+
+primary_region   = "us-east-1"
+secondary_region = "eu-west-1"
+project          = "streamflix"
+environment      = "dev"
+
+primary_vpc_cidr   = "10.0.0.0/16"
+secondary_vpc_cidr = "10.1.0.0/16"
+
+# S3 bucket names MUST be globally unique across all of AWS.
+# Replace 1234 with random characters of your own.
+primary_content_bucket   = "streamflix-content-primary-1234"
+secondary_content_bucket = "streamflix-content-secondary-1234"
